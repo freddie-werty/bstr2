@@ -15,24 +15,34 @@
     <script src="https://unpkg.com/lucide@latest"></script>
     <!-- SheetJS (Excel) -->
     <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+    <!-- Leaflet Maps API -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap');
         body { font-family: 'Noto Sans TC', sans-serif; }
         .animate-spin { animation: spin 1s linear infinite; }
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        #map { height: 400px; width: 100%; border-radius: 1rem; z-index: 10; }
+        .custom-bus-icon {
+            background-color: #2563eb;
+            border: 2px solid white;
+            border-radius: 50%;
+            width: 14px;
+            height: 14px;
+            box-shadow: 0 0 10px rgba(37, 99, 235, 0.6);
+        }
     </style>
 </head>
-<body class="bg-gray-50">
+<body class="bg-gray-50 text-gray-900">
     <div id="root"></div>
 
-    <!-- Firebase SDK Scripts -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-app.js";
         import { getFirestore, collection, addDoc, onSnapshot, query, doc } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore.js";
         import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-auth.js";
 
-        // Firebase 配置 (bus-rt 專案)
         const firebaseConfig = {
             apiKey: "AIzaSyBWF_CsRtwuNzif4pn6e-AtEVnzaCRe8ZU",
             authDomain: "bus-rt.firebaseapp.com",
@@ -48,141 +58,193 @@
             const db = getFirestore(app);
             const appId = "bus-system-web-v1";
 
-            // 將 Firebase 實例掛載到 window
-            window.fb = { 
-                db, 
-                auth, 
-                collection, 
-                addDoc, 
-                onSnapshot, 
-                query, 
-                appId,
-                config: firebaseConfig,
-                onAuthStateChanged,
-                signInAnonymously
-            };
-            console.log("Firebase 模組已就緒");
+            window.fb = { db, auth, collection, addDoc, onSnapshot, query, appId, onAuthStateChanged, signInAnonymously };
         } catch (e) {
-            console.error("Firebase 初始化失敗:", e);
+            console.error("Firebase Init Error:", e);
         }
     </script>
 
     <script type="text/babel">
-        const { useState, useEffect } = React;
+        const { useState, useEffect, useRef } = React;
 
         const App = () => {
             const [user, setUser] = useState(null);
             const [activeTab, setActiveTab] = useState('routes');
+            const [selectedRoute, setSelectedRoute] = useState(null);
             const [operators, setOperators] = useState([]);
             const [routes, setRoutes] = useState([]);
             const [loading, setLoading] = useState(true);
-            const [errorMsg, setErrorMsg] = useState(null);
-            const [routeStops, setRouteStops] = useState({ outbound: [], returnTrip: [] });
             
+            // 地圖與模擬狀態
+            const [simulationIndex, setSimulationIndex] = useState(0);
+            const [isSimulating, setIsSimulating] = useState(false);
+            const mapRef = useRef(null);
+            const markersRef = useRef([]);
+            const busMarkerRef = useRef(null);
+
             // 表單狀態
             const [newOperator, setNewOperator] = useState({ name: '', contact: '', phone: '' });
-            const [newRoute, setNewRoute] = useState({ name: '', number: '', operatorId: '', baseFare: 15, farePerStop: 5 });
+            const [newRoute, setNewRoute] = useState({ name: '', number: '', operatorId: '', routeMap: null, stopPhotos: [] });
+            const [routeStops, setRouteStops] = useState({ outbound: [], returnTrip: [] });
 
             useEffect(() => {
-                let unsubOps = null;
-                let unsubRoutes = null;
-                let unsubAuth = null;
-
-                const initFirebaseConnection = () => {
-                    const { auth, db, appId, onSnapshot, query, collection, signInAnonymously, onAuthStateChanged } = window.fb;
-
-                    // 1. 執行匿名登入
-                    signInAnonymously(auth).catch(err => {
-                        console.error("Auth Error:", err);
-                        setErrorMsg(`連線失敗: 請確認 Firebase 已開啟「匿名登入」功能。(${err.code})`);
-                    });
-
-                    // 2. 監聽登入狀態並開啟資料流
-                    unsubAuth = onAuthStateChanged(auth, (u) => {
-                        if (u) {
-                            console.log("連線成功，UID:", u.uid);
-                            setUser(u);
-                            setErrorMsg(null);
-
-                            // 監聽業者
-                            unsubOps = onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'operators')), 
-                                (snap) => {
-                                    setOperators(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-                                }, 
-                                (err) => {
-                                    console.error("Operators Error:", err);
-                                    setErrorMsg("資料讀取受阻：請確認 Firestore Rules 已發佈。");
-                                }
-                            );
-
-                            // 監聽路線
-                            unsubRoutes = onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'routes')), 
-                                (snap) => {
+                let unsubOps, unsubRoutes, unsubAuth;
+                const checkFB = setInterval(() => {
+                    if (window.fb) {
+                        clearInterval(checkFB);
+                        const { auth, db, appId, onSnapshot, query, collection, signInAnonymously, onAuthStateChanged } = window.fb;
+                        
+                        signInAnonymously(auth).catch(err => console.error("Auth Error:", err));
+                        
+                        unsubAuth = onAuthStateChanged(auth, (u) => {
+                            if (u) {
+                                setUser(u);
+                                // 監聽業者資料
+                                unsubOps = onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'operators')), snap => 
+                                    setOperators(snap.docs.map(doc => ({ id: doc.id, ...doc.data() }))));
+                                // 監聽路線資料
+                                unsubRoutes = onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'routes')), snap => {
                                     setRoutes(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
                                     setLoading(false);
-                                }, 
-                                (err) => {
-                                    console.error("Routes Error:", err);
-                                    setLoading(false);
-                                }
-                            );
-                        }
-                    });
-                };
-
-                // 等待 Firebase SDK 注入 window
-                const checkInterval = setInterval(() => {
-                    if (window.fb) {
-                        clearInterval(checkInterval);
-                        initFirebaseConnection();
+                                });
+                            }
+                        });
                     }
                 }, 100);
-
                 return () => {
-                    clearInterval(checkInterval);
+                    clearInterval(checkFB);
                     if (unsubOps) unsubOps();
                     if (unsubRoutes) unsubRoutes();
                     if (unsubAuth) unsubAuth();
                 };
             }, []);
 
+            // 地圖初始化邏輯
+            useEffect(() => {
+                if (selectedRoute && selectedRoute.outbound?.length > 0) {
+                    const firstStop = selectedRoute.outbound[0];
+                    if (!mapRef.current) {
+                        mapRef.current = L.map('map').setView([firstStop.lat, firstStop.lng], 13);
+                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                            attribution: '© OpenStreetMap'
+                        }).addTo(mapRef.current);
+                    } else {
+                        mapRef.current.setView([firstStop.lat, firstStop.lng], 13);
+                    }
+
+                    // 清除舊標記
+                    markersRef.current.forEach(m => m.remove());
+                    markersRef.current = [];
+
+                    // 繪製路徑線
+                    const polylinePoints = selectedRoute.outbound.map(s => [s.lat, s.lng]);
+                    const polyline = L.polyline(polylinePoints, { color: '#3b82f6', weight: 5, opacity: 0.7 }).addTo(mapRef.current);
+                    markersRef.current.push(polyline);
+
+                    // 繪製站點
+                    selectedRoute.outbound.forEach((stop, i) => {
+                        const m = L.circleMarker([stop.lat, stop.lng], {
+                            radius: 6,
+                            fillColor: "#ffffff",
+                            color: "#2563eb",
+                            weight: 2,
+                            opacity: 1,
+                            fillOpacity: 1
+                        }).addTo(mapRef.current).bindPopup(`<b>${i+1}. ${stop.name}</b>`);
+                        markersRef.current.push(m);
+                    });
+
+                    // 初始公車圖標
+                    if (busMarkerRef.current) busMarkerRef.current.remove();
+                    busMarkerRef.current = L.marker([firstStop.lat, firstStop.lng], {
+                        icon: L.divIcon({ className: 'custom-bus-icon', iconSize: [14, 14] })
+                    }).addTo(mapRef.current);
+                }
+            }, [selectedRoute]);
+
+            // 駕駛模擬邏輯
+            useEffect(() => {
+                if (isSimulating && selectedRoute && busMarkerRef.current) {
+                    const timer = setInterval(() => {
+                        setSimulationIndex(prev => {
+                            const next = (prev + 1) % selectedRoute.outbound.length;
+                            const nextStop = selectedRoute.outbound[next];
+                            busMarkerRef.current.setLatLng([nextStop.lat, nextStop.lng]);
+                            mapRef.current.panTo([nextStop.lat, nextStop.lng]);
+                            return next;
+                        });
+                    }, 2500);
+                    return () => clearInterval(timer);
+                }
+            }, [isSimulating, selectedRoute]);
+
+            // 解析 Excel/CSV 站址資料
             const handleExcelUpload = (e) => {
                 const file = e.target.files[0];
                 if (!file) return;
                 const reader = new FileReader();
                 reader.onload = (evt) => {
-                    const bstr = evt.target.result;
-                    const wb = XLSX.read(bstr, { type: 'binary' });
+                    const wb = XLSX.read(evt.target.result, { type: 'binary' });
                     const result = { outbound: [], returnTrip: [] };
 
-                    wb.SheetNames.forEach(sheetName => {
-                        const ws = wb.Sheets[sheetName];
-                        const data = XLSX.utils.sheet_to_json(ws);
-                        const formatted = data.map(row => ({
-                            name: row['站名'] || row['name'] || '未命名站點',
-                            lat: parseFloat(row['緯度'] || row['lat'] || 0),
-                            lng: parseFloat(row['經度'] || row['lng'] || 0),
-                            sequence: parseInt(row['站序'] || row['sequence'] || 0)
-                        })).sort((a, b) => a.sequence - b.sequence);
+                    wb.SheetNames.forEach(name => {
+                        const data = XLSX.utils.sheet_to_json(wb.Sheets[name]);
+                        const formatted = data.map(row => {
+                            const findVal = (keys) => {
+                                const found = Object.keys(row).find(k => keys.some(key => k.toLowerCase().includes(key.toLowerCase())));
+                                return found ? row[found] : null;
+                            };
+                            return {
+                                name: findVal(['站名', 'name', 'station']) || '未命名',
+                                lat: parseFloat(findVal(['緯度', 'Latitude', 'lat']) || 0),
+                                lng: parseFloat(findVal(['經度', 'Longitude', 'lng']) || 0),
+                                sequence: parseInt(findVal(['站序', 'sequence', 'no']) || 0)
+                            };
+                        }).filter(s => s.lat !== 0).sort((a, b) => a.sequence - b.sequence);
 
-                        if (sheetName.includes('去') || sheetName.toLowerCase().includes('out')) {
-                            result.outbound = formatted;
-                        } else if (sheetName.includes('回') || sheetName.includes('返') || sheetName.toLowerCase().includes('return')) {
-                            result.returnTrip = formatted;
-                        } else if (result.outbound.length === 0) {
-                            result.outbound = formatted;
-                        } else {
-                            result.returnTrip = formatted;
-                        }
+                        if (name.includes('去') || name.toLowerCase().includes('out')) result.outbound = formatted;
+                        else if (name.includes('回') || name.includes('返') || name.toLowerCase().includes('return')) result.returnTrip = formatted;
+                        else if (result.outbound.length === 0) result.outbound = formatted;
+                        else result.returnTrip = formatted;
                     });
                     setRouteStops(result);
                 };
                 reader.readAsBinaryString(file);
             };
 
+            const handleImageUpload = (e, type) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (evt) => {
+                    if (type === 'map') setNewRoute({...newRoute, routeMap: evt.target.result});
+                    else setNewRoute({...newRoute, stopPhotos: [...newRoute.stopPhotos, evt.target.result]});
+                };
+                reader.readAsDataURL(file);
+            };
+
+            // 儲存業者 (修復此處的 ReferenceError)
+            const saveOperator = async () => {
+                if (!newOperator.name) {
+                    alert("請輸入業者名稱");
+                    return;
+                }
+                const { db, collection, addDoc, appId } = window.fb;
+                try {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'operators'), {
+                        ...newOperator,
+                        createdAt: Date.now()
+                    });
+                    setNewOperator({ name: '', contact: '', phone: '' });
+                } catch (e) { 
+                    alert("儲存業者失敗：" + e.message); 
+                }
+            };
+
+            // 儲存路線
             const saveRoute = async () => {
                 if (!newRoute.number || !newRoute.operatorId || routeStops.outbound.length === 0) {
-                    alert("請填寫完整資訊並匯入站點 Excel");
+                    alert("請確保已填寫編號、選取業者並匯入站址資料");
                     return;
                 }
                 const { db, collection, addDoc, appId } = window.fb;
@@ -193,150 +255,203 @@
                         returnTrip: routeStops.returnTrip,
                         createdAt: Date.now()
                     });
-                    setNewRoute({ name: '', number: '', operatorId: '', baseFare: 15, farePerStop: 5 });
+                    setNewRoute({ name: '', number: '', operatorId: '', routeMap: null, stopPhotos: [] });
                     setRouteStops({ outbound: [], returnTrip: [] });
                     setActiveTab('routes');
-                } catch (e) {
-                    alert("儲存失敗: " + e.message);
-                }
-            };
-
-            const saveOperator = async () => {
-                if (!newOperator.name) return;
-                const { db, collection, addDoc, appId } = window.fb;
-                try {
-                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'operators'), {
-                        ...newOperator,
-                        createdAt: Date.now()
-                    });
-                    setNewOperator({ name: '', contact: '', phone: '' });
-                } catch (e) {
-                    alert("新增失敗: " + e.message);
+                } catch (e) { 
+                    alert("儲存路線失敗：" + e.message); 
                 }
             };
 
             return (
                 <div className="min-h-screen flex flex-col">
-                    <header className="bg-white border-b border-gray-200 px-6 py-4 flex flex-col md:flex-row justify-between items-center sticky top-0 z-50 gap-4">
+                    <header className="bg-white border-b border-gray-200 px-6 py-4 flex flex-col md:flex-row justify-between items-center sticky top-0 z-[100] gap-4 shadow-sm">
                         <div className="flex items-center gap-3">
-                            <div className="bg-blue-600 p-2 rounded-lg text-white">
-                                <i data-lucide="bus"></i>
-                            </div>
-                            <h1 className="text-xl font-bold text-gray-800">公車智慧管理系統</h1>
+                            <div className="bg-blue-600 p-2 rounded-xl text-white shadow-lg shadow-blue-100"><i data-lucide="bus"></i></div>
+                            <h1 className="text-xl font-black text-gray-800 tracking-tight">公車智慧管理系統</h1>
                         </div>
-                        <div className="flex gap-2 text-sm">
-                            <button onClick={() => setActiveTab('routes')} className={`px-4 py-2 rounded-lg transition-colors ${activeTab === 'routes' ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>路線總覽</button>
-                            <button onClick={() => setActiveTab('add-route')} className={`px-4 py-2 rounded-lg transition-colors ${activeTab === 'add-route' ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>新增路線</button>
-                            <button onClick={() => setActiveTab('operators')} className={`px-4 py-2 rounded-lg transition-colors ${activeTab === 'operators' ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>業者管理</button>
-                        </div>
+                        <nav className="flex bg-gray-100 p-1 rounded-xl">
+                            <button onClick={() => {setActiveTab('routes'); setSelectedRoute(null); setIsSimulating(false);}} className={`px-5 py-2 rounded-lg text-sm font-bold transition-all ${activeTab === 'routes' ? 'bg-white shadow-sm text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}>路線總覽</button>
+                            <button onClick={() => {setActiveTab('add-route'); setSelectedRoute(null);}} className={`px-5 py-2 rounded-lg text-sm font-bold transition-all ${activeTab === 'add-route' ? 'bg-white shadow-sm text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}>新增路線</button>
+                            <button onClick={() => {setActiveTab('operators'); setSelectedRoute(null);}} className={`px-5 py-2 rounded-lg text-sm font-bold transition-all ${activeTab === 'operators' ? 'bg-white shadow-sm text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}>業者管理</button>
+                        </nav>
                     </header>
 
                     <main className="p-6 max-w-7xl mx-auto w-full flex-grow">
-                        {errorMsg && (
-                            <div className="bg-red-50 border-l-4 border-red-500 p-4 mb-6 rounded shadow-sm animate-pulse">
-                                <div className="flex items-center gap-3">
-                                    <div className="text-red-500 font-bold">⚠️ 連線警報:</div>
-                                    <div className="text-red-700 text-sm">{errorMsg}</div>
-                                </div>
-                            </div>
-                        )}
-
                         {loading ? (
-                            <div className="flex flex-col items-center py-20 gap-4 text-gray-500">
-                                <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600"></div>
-                                <p className="text-sm">正在同步雲端資料庫...</p>
+                            <div className="flex flex-col items-center py-24 gap-4 text-gray-400">
+                                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+                                <p className="font-medium">載入中...</p>
                             </div>
-                        ) : (
-                            activeTab === 'routes' ? (
-                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                                    {routes.length === 0 ? (
-                                        <div className="col-span-full py-20 text-center text-gray-400 bg-white rounded-xl border border-dashed">
-                                            尚未建立任何路線
-                                        </div>
-                                    ) : routes.map(route => (
-                                        <div key={route.id} className="bg-white rounded-xl shadow-sm border p-5 hover:border-blue-300 transition-all">
-                                            <div className="flex justify-between mb-2">
-                                                <span className="text-[10px] font-bold text-blue-600 bg-blue-50 px-2 py-0.5 rounded">
-                                                    {operators.find(o => o.id === route.operatorId)?.name || '未指定業者'}
-                                                </span>
-                                                <span className="text-gray-400 font-mono text-xs">#{route.number}</span>
+                        ) : activeTab === 'routes' ? (
+                            selectedRoute ? (
+                                <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+                                    <div className="bg-white p-6 rounded-3xl border shadow-sm mb-6 flex flex-col md:flex-row justify-between items-center gap-4">
+                                        <div className="flex items-center gap-4">
+                                            <div className="bg-blue-50 text-blue-600 font-black text-2xl px-4 py-2 rounded-2xl">{selectedRoute.number}</div>
+                                            <div>
+                                                <h2 className="text-2xl font-bold">{selectedRoute.name}</h2>
+                                                <p className="text-sm text-gray-400">{operators.find(o => o.id === selectedRoute.operatorId)?.name}</p>
                                             </div>
-                                            <h3 className="text-lg font-bold mb-3">{route.name}</h3>
-                                            <div className="text-sm text-gray-500 flex justify-between border-t pt-3">
-                                                <span>去程 {route.outbound?.length || 0} 站</span>
-                                                <span>返程 {route.returnTrip?.length || 0} 站</span>
+                                        </div>
+                                        <div className="flex gap-3">
+                                            <button onClick={() => setIsSimulating(!isSimulating)} className={`flex items-center gap-2 px-6 py-3 rounded-2xl font-bold transition-all ${isSimulating ? 'bg-red-50 text-red-600' : 'bg-blue-600 text-white hover:bg-blue-700 shadow-lg shadow-blue-100'}`}>
+                                                <i data-lucide={isSimulating ? "square" : "play"} size="18"></i>
+                                                {isSimulating ? '停止模擬' : '開始駕駛模擬'}
+                                            </button>
+                                            <button onClick={() => {setSelectedRoute(null); setIsSimulating(false);}} className="p-3 border rounded-2xl text-gray-400 hover:bg-gray-50 transition-colors"><i data-lucide="x"></i></button>
+                                        </div>
+                                    </div>
+
+                                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                                        <div className="lg:col-span-2 space-y-6">
+                                            <div id="map" className="shadow-inner border bg-gray-200"></div>
+                                            <div className="bg-white rounded-3xl border p-6">
+                                                <h3 className="font-bold mb-6 flex items-center gap-2 text-gray-700">去程站點清單</h3>
+                                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                                    {selectedRoute.outbound?.map((stop, idx) => (
+                                                        <div key={idx} className={`flex items-center p-3 rounded-2xl border transition-all ${idx === simulationIndex && isSimulating ? 'border-blue-500 bg-blue-50 shadow-sm' : 'border-gray-100'}`}>
+                                                            <span className={`w-8 h-8 flex items-center justify-center rounded-full text-xs font-bold mr-3 ${idx === simulationIndex && isSimulating ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-400'}`}>{idx + 1}</span>
+                                                            <p className={`font-bold text-sm ${idx === simulationIndex && isSimulating ? 'text-blue-700' : 'text-gray-700'}`}>{stop.name}</p>
+                                                            {idx === simulationIndex && isSimulating && <div className="ml-auto text-blue-600 animate-bounce"><i data-lucide="bus" size="14"></i></div>}
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div className="space-y-6">
+                                            <div className="bg-white rounded-3xl border p-6 shadow-sm">
+                                                <h3 className="font-bold mb-4 flex items-center gap-2"><i data-lucide="image" size="18"></i> 路線圖</h3>
+                                                {selectedRoute.routeMap ? <img src={selectedRoute.routeMap} className="w-full rounded-2xl border" /> : <div className="bg-gray-50 aspect-video rounded-2xl flex items-center justify-center text-gray-300 text-sm italic">未上傳</div>}
+                                            </div>
+                                            <div className="bg-white rounded-3xl border p-6 shadow-sm">
+                                                <h3 className="font-bold mb-4 flex items-center gap-2"><i data-lucide="camera" size="18"></i> 站牌照片</h3>
+                                                <div className="grid grid-cols-2 gap-2">
+                                                    {selectedRoute.stopPhotos?.map((p, i) => <img key={i} src={p} className="w-full h-24 object-cover rounded-xl border" />)}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                                    {routes.map(route => (
+                                        <div key={route.id} onClick={() => setSelectedRoute(route)} className="group bg-white rounded-3xl shadow-sm border border-gray-100 p-6 hover:border-blue-500 hover:shadow-2xl transition-all cursor-pointer">
+                                            <div className="flex justify-between items-start mb-6">
+                                                <div className="bg-blue-50 text-blue-600 text-xs font-black px-3 py-1 rounded-full">{route.number}</div>
+                                                <div className="text-gray-300 group-hover:text-blue-500 transition-colors"><i data-lucide="arrow-up-right"></i></div>
+                                            </div>
+                                            <h3 className="text-2xl font-bold mb-2">{route.name}</h3>
+                                            <p className="text-sm text-gray-400 mb-6">{operators.find(o => o.id === route.operatorId)?.name || '未指定業者'}</p>
+                                            <div className="flex items-center gap-4 text-xs font-bold text-gray-500 pt-4 border-t border-gray-50">
+                                                <span className="flex items-center gap-1"><i data-lucide="map-pin" size="12"></i> {route.outbound?.length || 0} 站</span>
                                             </div>
                                         </div>
                                     ))}
                                 </div>
-                            ) : activeTab === 'add-route' ? (
-                                <div className="bg-white rounded-2xl p-8 max-w-2xl mx-auto border shadow-sm space-y-6">
-                                    <h2 className="text-xl font-bold flex items-center gap-2">建立新路線</h2>
-                                    <div className="grid grid-cols-2 gap-4">
-                                        <div className="space-y-1">
-                                            <label className="text-xs text-gray-400">路線編號</label>
-                                            <input type="text" placeholder="例如: 706" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500 outline-none" value={newRoute.number} onChange={e => setNewRoute({...newRoute, number: e.target.value})}/>
-                                        </div>
-                                        <div className="space-y-1">
-                                            <label className="text-xs text-gray-400">路線名稱</label>
-                                            <input type="text" placeholder="例如: 三峽-西門" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500 outline-none" value={newRoute.name} onChange={e => setNewRoute({...newRoute, name: e.target.value})}/>
-                                        </div>
-                                    </div>
-                                    <div className="space-y-1">
-                                        <label className="text-xs text-gray-400">營運業者</label>
-                                        <select className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500 outline-none" value={newRoute.operatorId} onChange={e => setNewRoute({...newRoute, operatorId: e.target.value})}>
-                                            <option value="">請選擇業者...</option>
-                                            {operators.map(op => <option key={op.id} value={op.id}>{op.name}</option>)}
-                                        </select>
-                                    </div>
-                                    <div className="border-2 border-dashed p-8 text-center rounded-xl bg-gray-50 hover:bg-gray-100 transition-colors">
-                                        <input type="file" id="xl" className="hidden" accept=".xlsx,.xls" onChange={handleExcelUpload}/>
-                                        <label htmlFor="xl" className="cursor-pointer block">
-                                            <div className="flex flex-col items-center gap-2 text-gray-500">
-                                                <i data-lucide="file-up"></i>
-                                                <p className="font-bold">上傳站點 Excel</p>
-                                            </div>
-                                            {routeStops.outbound.length > 0 && <p className="text-green-600 text-xs mt-2">已就緒 ({routeStops.outbound.length} 站)</p>}
-                                        </label>
-                                    </div>
-                                    <button onClick={saveRoute} className="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold transition-shadow shadow-lg shadow-blue-200">發布路線到雲端</button>
-                                </div>
-                            ) : (
-                                <div className="max-w-4xl mx-auto space-y-6">
-                                    <div className="bg-white p-6 rounded-xl border shadow-sm">
-                                        <h2 className="font-bold mb-4">註冊新業者</h2>
-                                        <div className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">
-                                            <input placeholder="業者名稱" className="border p-2 rounded text-sm" value={newOperator.name} onChange={e => setNewOperator({...newOperator, name: e.target.value})}/>
-                                            <input placeholder="聯絡人" className="border p-2 rounded text-sm" value={newOperator.contact} onChange={e => setNewOperator({...newOperator, contact: e.target.value})}/>
-                                            <input placeholder="電話" className="border p-2 rounded text-sm" value={newOperator.phone} onChange={e => setNewOperator({...newOperator, phone: e.target.value})}/>
-                                            <button onClick={saveOperator} className="bg-gray-800 hover:bg-black text-white py-2 rounded font-bold text-sm transition-colors">新增業者</button>
-                                        </div>
-                                    </div>
-                                    <div className="bg-white rounded-xl border overflow-hidden shadow-sm">
-                                        <table className="w-full text-left">
-                                            <thead className="bg-gray-50 text-[10px] text-gray-400 uppercase">
-                                                <tr><th className="p-4">業者</th><th className="p-4">聯繫方式</th></tr>
-                                            </thead>
-                                            <tbody className="divide-y divide-gray-100 text-sm">
-                                                {operators.length === 0 ? (
-                                                    <tr><td colSpan="2" className="p-10 text-center text-gray-300">目前無合作業者</td></tr>
-                                                ) : operators.map(op => (
-                                                    <tr key={op.id} className="hover:bg-gray-50">
-                                                        <td className="p-4 font-bold">{op.name}</td>
-                                                        <td className="p-4 text-gray-500">{op.contact} / {op.phone}</td>
-                                                    </tr>
-                                                ))}
-                                            </tbody>
-                                        </table>
-                                    </div>
-                                </div>
                             )
+                        ) : activeTab === 'add-route' ? (
+                            <div className="bg-white rounded-[2rem] p-10 max-w-4xl mx-auto border shadow-sm space-y-10">
+                                <h2 className="text-3xl font-black text-gray-800">發布新路線</h2>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                                    <div className="space-y-6">
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div className="space-y-2">
+                                                <label className="text-xs font-black uppercase tracking-wider text-gray-400">編號</label>
+                                                <input type="text" placeholder="例: 706" className="w-full bg-gray-50 border-none p-4 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none font-bold" value={newRoute.number} onChange={e => setNewRoute({...newRoute, number: e.target.value})}/>
+                                            </div>
+                                            <div className="space-y-2">
+                                                <label className="text-xs font-black uppercase tracking-wider text-gray-400">名稱</label>
+                                                <input type="text" placeholder="例: 三峽-台北" className="w-full bg-gray-50 border-none p-4 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none font-bold" value={newRoute.name} onChange={e => setNewRoute({...newRoute, name: e.target.value})}/>
+                                            </div>
+                                        </div>
+                                        <div className="space-y-2">
+                                            <label className="text-xs font-black uppercase tracking-wider text-gray-400">營運業者</label>
+                                            <select className="w-full bg-gray-50 border-none p-4 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none font-bold appearance-none" value={newRoute.operatorId} onChange={e => setNewRoute({...newRoute, operatorId: e.target.value})}>
+                                                <option value="">選擇合作業者</option>
+                                                {operators.map(op => <option key={op.id} value={op.id}>{op.name}</option>)}
+                                            </select>
+                                        </div>
+                                        <div className="space-y-2">
+                                            <label className="text-xs font-black uppercase tracking-wider text-gray-400">站點 Excel/CSV 資料</label>
+                                            <label className="flex flex-col items-center justify-center p-8 border-2 border-dashed border-gray-200 rounded-[2rem] bg-gray-50 hover:bg-gray-100 transition-all cursor-pointer">
+                                                <input type="file" className="hidden" accept=".xlsx,.xls,.csv" onChange={handleExcelUpload}/>
+                                                <i data-lucide="upload-cloud" className="text-blue-500 mb-2"></i>
+                                                <p className="font-bold text-sm text-gray-600">匯入站址表</p>
+                                                {routeStops.outbound.length > 0 && <p className="text-xs text-green-500 mt-2 font-bold">已讀取 {routeStops.outbound.length} 個座標</p>}
+                                            </label>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-6">
+                                        <div className="space-y-2">
+                                            <label className="text-xs font-black uppercase tracking-wider text-gray-400">路線圖</label>
+                                            <label className="block relative aspect-video bg-gray-50 rounded-2xl border border-gray-100 overflow-hidden cursor-pointer group">
+                                                {newRoute.routeMap ? <img src={newRoute.routeMap} className="w-full h-full object-contain" /> : <div className="flex flex-col items-center justify-center h-full text-gray-300"><i data-lucide="image" size="32"></i><span className="text-[10px] font-bold mt-2">上傳路線圖</span></div>}
+                                                <input type="file" className="hidden" accept="image/*" onChange={e => handleImageUpload(e, 'map')} />
+                                            </label>
+                                        </div>
+                                        <div className="space-y-2">
+                                            <label className="text-xs font-black uppercase tracking-wider text-gray-400">站點照片</label>
+                                            <div className="flex gap-2 overflow-x-auto pb-2">
+                                                {newRoute.stopPhotos.map((p, i) => <img key={i} src={p} className="h-20 w-20 rounded-xl object-cover" />)}
+                                                <label className="h-20 w-20 min-w-[5rem] flex items-center justify-center bg-gray-100 rounded-xl cursor-pointer hover:bg-gray-200 text-gray-400"><i data-lucide="plus"></i><input type="file" className="hidden" onChange={e => handleImageUpload(e, 'photo')} /></label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <button onClick={saveRoute} className="w-full py-5 bg-blue-600 hover:bg-blue-700 text-white rounded-[2rem] font-black text-lg transition-all shadow-xl shadow-blue-100 flex items-center justify-center gap-3"><i data-lucide="send"></i> 確認上傳</button>
+                            </div>
+                        ) : (
+                            <div className="max-w-4xl mx-auto space-y-8 animate-in fade-in">
+                                <div className="bg-white p-10 rounded-[2rem] border shadow-sm">
+                                    <h2 className="text-2xl font-black mb-8 flex items-center gap-2"><i data-lucide="user-plus"></i> 新增業者</h2>
+                                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+                                        <div className="md:col-span-1 space-y-2">
+                                            <label className="text-[10px] font-black text-gray-400 uppercase">業者全稱</label>
+                                            <input placeholder="例: 桃園客運" className="w-full bg-gray-50 border-none p-4 rounded-xl font-bold" value={newOperator.name} onChange={e => setNewOperator({...newOperator, name: e.target.value})}/>
+                                        </div>
+                                        <div className="md:col-span-1 space-y-2">
+                                            <label className="text-[10px] font-black text-gray-400 uppercase">主要聯絡人</label>
+                                            <input placeholder="姓名" className="w-full bg-gray-50 border-none p-4 rounded-xl font-bold" value={newOperator.contact} onChange={e => setNewOperator({...newOperator, contact: e.target.value})}/>
+                                        </div>
+                                        <div className="md:col-span-1 space-y-2">
+                                            <label className="text-[10px] font-black text-gray-400 uppercase">聯絡電話</label>
+                                            <input placeholder="電話" className="w-full bg-gray-50 border-none p-4 rounded-xl font-bold" value={newOperator.phone} onChange={e => setNewOperator({...newOperator, phone: e.target.value})}/>
+                                        </div>
+                                        <button onClick={saveOperator} className="bg-gray-900 text-white py-4 rounded-xl font-black shadow-lg hover:bg-black transition-all">註冊業者</button>
+                                    </div>
+                                </div>
+                                <div className="bg-white rounded-[2rem] border overflow-hidden">
+                                    <table className="w-full">
+                                        <thead className="bg-gray-50 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b">
+                                            <tr><th className="p-6 text-left">品牌名稱</th><th className="p-6 text-left">通訊聯繫</th><th className="p-6 text-right">當前狀態</th></tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-gray-50">
+                                            {operators.length === 0 ? (
+                                                <tr><td colSpan="3" className="p-10 text-center text-gray-300 italic font-medium">尚無業者資料</td></tr>
+                                            ) : (
+                                                operators.map(op => (
+                                                    <tr key={op.id} className="hover:bg-blue-50/30 transition-colors">
+                                                        <td className="p-6 font-black text-gray-800">{op.name}</td>
+                                                        <td className="p-6 text-sm text-gray-500">{op.contact || '-'} ｜ {op.phone || '-'}</td>
+                                                        <td className="p-6 text-right"><span className="bg-green-100 text-green-600 px-3 py-1 rounded-full text-[10px] font-black">已認證</span></td>
+                                                    </tr>
+                                                ))
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
                         )}
                     </main>
 
-                    <footer className="p-4 text-center text-[10px] text-gray-400 border-t bg-white flex justify-center gap-4">
-                        <span>連線狀態: <span className={user ? "text-green-500" : "text-orange-500"}>{user ? '已連線' : '同步中'}</span></span>
-                        <span>專案: {window.fb?.config?.projectId}</span>
+                    <footer className="p-8 text-center text-[10px] font-black text-gray-300 uppercase tracking-widest bg-white border-t flex flex-col md:flex-row justify-center items-center gap-6">
+                        <div className="flex items-center gap-2">
+                            <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
+                            <span>Cloud DB Connected</span>
+                        </div>
+                        <div className="hidden md:block text-gray-100">|</div>
+                        <span>App ID: {window.fb?.appId}</span>
                     </footer>
                 </div>
             );
@@ -346,11 +461,8 @@
         root.render(<App />);
 
         const initIcons = () => {
-            if (window.lucide) {
-                lucide.createIcons();
-            } else {
-                setTimeout(initIcons, 50);
-            }
+            if (window.lucide) lucide.createIcons();
+            else setTimeout(initIcons, 50);
         };
         initIcons();
     </script>
