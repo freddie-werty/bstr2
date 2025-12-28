@@ -32,36 +32,43 @@
         import { getFirestore, collection, addDoc, onSnapshot, query, doc } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore.js";
         import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-auth.js";
 
-        // 配置資訊
+        // Firebase 配置 (bus-rt 專案)
         const firebaseConfig = {
-            apiKey: "AIzaSyDM-w_NjBnv5wZnlwPGsVjJFlEDBBDdaSQ",
-            authDomain: "bus-run-time.firebaseapp.com",
-            projectId: "bus-run-time",
-            storageBucket: "bus-run-time.firebasestorage.app",
-            messagingSenderId: "169319406878",
-            appId: "1:169319406878:web:e9e2b2172b80f0c46ffd0f"
+            apiKey: "AIzaSyBWF_CsRtwuNzif4pn6e-AtEVnzaCRe8ZU",
+            authDomain: "bus-rt.firebaseapp.com",
+            projectId: "bus-rt",
+            storageBucket: "bus-rt.firebasestorage.app",
+            messagingSenderId: "936532445760",
+            appId: "1:936532445760:web:fc6efd24ba1d87e2492da5"
         };
 
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-        const appId = "bus-system-web-v1";
+        try {
+            const app = initializeApp(firebaseConfig);
+            const auth = getAuth(app);
+            const db = getFirestore(app);
+            const appId = "bus-system-web-v1";
 
-        // 將 Firebase 實例與配置掛載到 window 供 React 使用
-        window.fb = { 
-            db, 
-            auth, 
-            collection, 
-            addDoc, 
-            onSnapshot, 
-            query, 
-            appId,
-            config: firebaseConfig 
-        };
+            // 將 Firebase 實例掛載到 window
+            window.fb = { 
+                db, 
+                auth, 
+                collection, 
+                addDoc, 
+                onSnapshot, 
+                query, 
+                appId,
+                config: firebaseConfig,
+                onAuthStateChanged,
+                signInAnonymously
+            };
+            console.log("Firebase 模組已就緒");
+        } catch (e) {
+            console.error("Firebase 初始化失敗:", e);
+        }
     </script>
 
     <script type="text/babel">
-        const { useState, useEffect, useMemo } = React;
+        const { useState, useEffect } = React;
 
         const App = () => {
             const [user, setUser] = useState(null);
@@ -69,7 +76,7 @@
             const [operators, setOperators] = useState([]);
             const [routes, setRoutes] = useState([]);
             const [loading, setLoading] = useState(true);
-            const [timeoutError, setTimeoutError] = useState(false);
+            const [errorMsg, setErrorMsg] = useState(null);
             const [routeStops, setRouteStops] = useState({ outbound: [], returnTrip: [] });
             
             // 表單狀態
@@ -77,47 +84,67 @@
             const [newRoute, setNewRoute] = useState({ name: '', number: '', operatorId: '', baseFare: 15, farePerStop: 5 });
 
             useEffect(() => {
-                // 設定超時檢測 (10秒)
-                const timer = setTimeout(() => {
-                    if (loading) setTimeoutError(true);
-                }, 10000);
+                let unsubOps = null;
+                let unsubRoutes = null;
+                let unsubAuth = null;
 
-                const checkFB = setInterval(() => {
-                    if (window.fb) {
-                        clearInterval(checkFB);
-                        const { auth, onSnapshot, query, collection, appId, db } = window.fb;
-                        
-                        signInAnonymously(auth).catch(err => {
-                            console.error("Auth Error:", err);
-                            setTimeoutError(true);
-                        });
+                const initFirebaseConnection = () => {
+                    const { auth, db, appId, onSnapshot, query, collection, signInAnonymously, onAuthStateChanged } = window.fb;
 
-                        onAuthStateChanged(auth, (u) => {
+                    // 1. 執行匿名登入
+                    signInAnonymously(auth).catch(err => {
+                        console.error("Auth Error:", err);
+                        setErrorMsg(`連線失敗: 請確認 Firebase 已開啟「匿名登入」功能。(${err.code})`);
+                    });
+
+                    // 2. 監聽登入狀態並開啟資料流
+                    unsubAuth = onAuthStateChanged(auth, (u) => {
+                        if (u) {
+                            console.log("連線成功，UID:", u.uid);
                             setUser(u);
-                            if (u) {
-                                // 監聽業者資料
-                                onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'operators')), (snap) => {
+                            setErrorMsg(null);
+
+                            // 監聽業者
+                            unsubOps = onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'operators')), 
+                                (snap) => {
                                     setOperators(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-                                });
-                                // 監聽路線資料
-                                onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'routes')), (snap) => {
+                                }, 
+                                (err) => {
+                                    console.error("Operators Error:", err);
+                                    setErrorMsg("資料讀取受阻：請確認 Firestore Rules 已發佈。");
+                                }
+                            );
+
+                            // 監聽路線
+                            unsubRoutes = onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'routes')), 
+                                (snap) => {
                                     setRoutes(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
                                     setLoading(false);
-                                    clearTimeout(timer);
-                                }, (err) => {
-                                    console.error("Firestore Error:", err);
-                                    setTimeoutError(true);
-                                });
-                            }
-                        });
+                                }, 
+                                (err) => {
+                                    console.error("Routes Error:", err);
+                                    setLoading(false);
+                                }
+                            );
+                        }
+                    });
+                };
+
+                // 等待 Firebase SDK 注入 window
+                const checkInterval = setInterval(() => {
+                    if (window.fb) {
+                        clearInterval(checkInterval);
+                        initFirebaseConnection();
                     }
                 }, 100);
 
                 return () => {
-                    clearInterval(checkFB);
-                    clearTimeout(timer);
+                    clearInterval(checkInterval);
+                    if (unsubOps) unsubOps();
+                    if (unsubRoutes) unsubRoutes();
+                    if (unsubAuth) unsubAuth();
                 };
-            }, [loading]);
+            }, []);
 
             const handleExcelUpload = (e) => {
                 const file = e.target.files[0];
@@ -149,7 +176,6 @@
                         }
                     });
                     setRouteStops(result);
-                    alert(`匯入成功！去程：${result.outbound.length} 站 / 返程：${result.returnTrip.length} 站`);
                 };
                 reader.readAsBinaryString(file);
             };
@@ -160,25 +186,33 @@
                     return;
                 }
                 const { db, collection, addDoc, appId } = window.fb;
-                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'routes'), {
-                    ...newRoute,
-                    outbound: routeStops.outbound,
-                    returnTrip: routeStops.returnTrip,
-                    createdAt: Date.now()
-                });
-                setNewRoute({ name: '', number: '', operatorId: '', baseFare: 15, farePerStop: 5 });
-                setRouteStops({ outbound: [], returnTrip: [] });
-                setActiveTab('routes');
+                try {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'routes'), {
+                        ...newRoute,
+                        outbound: routeStops.outbound,
+                        returnTrip: routeStops.returnTrip,
+                        createdAt: Date.now()
+                    });
+                    setNewRoute({ name: '', number: '', operatorId: '', baseFare: 15, farePerStop: 5 });
+                    setRouteStops({ outbound: [], returnTrip: [] });
+                    setActiveTab('routes');
+                } catch (e) {
+                    alert("儲存失敗: " + e.message);
+                }
             };
 
             const saveOperator = async () => {
                 if (!newOperator.name) return;
                 const { db, collection, addDoc, appId } = window.fb;
-                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'operators'), {
-                    ...newOperator,
-                    createdAt: Date.now()
-                });
-                setNewOperator({ name: '', contact: '', phone: '' });
+                try {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'operators'), {
+                        ...newOperator,
+                        createdAt: Date.now()
+                    });
+                    setNewOperator({ name: '', contact: '', phone: '' });
+                } catch (e) {
+                    alert("新增失敗: " + e.message);
+                }
             };
 
             return (
@@ -190,96 +224,106 @@
                             </div>
                             <h1 className="text-xl font-bold text-gray-800">公車智慧管理系統</h1>
                         </div>
-                        <div className="flex gap-2">
-                            <button onClick={() => setActiveTab('routes')} className={`px-4 py-2 rounded-lg ${activeTab === 'routes' ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>路線總覽</button>
-                            <button onClick={() => setActiveTab('add-route')} className={`px-4 py-2 rounded-lg ${activeTab === 'add-route' ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>新增路線</button>
-                            <button onClick={() => setActiveTab('operators')} className={`px-4 py-2 rounded-lg ${activeTab === 'operators' ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>業者管理</button>
+                        <div className="flex gap-2 text-sm">
+                            <button onClick={() => setActiveTab('routes')} className={`px-4 py-2 rounded-lg transition-colors ${activeTab === 'routes' ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>路線總覽</button>
+                            <button onClick={() => setActiveTab('add-route')} className={`px-4 py-2 rounded-lg transition-colors ${activeTab === 'add-route' ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>新增路線</button>
+                            <button onClick={() => setActiveTab('operators')} className={`px-4 py-2 rounded-lg transition-colors ${activeTab === 'operators' ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>業者管理</button>
                         </div>
                     </header>
 
                     <main className="p-6 max-w-7xl mx-auto w-full flex-grow">
+                        {errorMsg && (
+                            <div className="bg-red-50 border-l-4 border-red-500 p-4 mb-6 rounded shadow-sm animate-pulse">
+                                <div className="flex items-center gap-3">
+                                    <div className="text-red-500 font-bold">⚠️ 連線警報:</div>
+                                    <div className="text-red-700 text-sm">{errorMsg}</div>
+                                </div>
+                            </div>
+                        )}
+
                         {loading ? (
                             <div className="flex flex-col items-center py-20 gap-4 text-gray-500">
                                 <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600"></div>
-                                <p>連線至 Firebase 專案中...</p>
-                                {timeoutError && (
-                                    <p className="text-red-500 text-sm bg-red-50 p-3 rounded-lg mt-4 animate-pulse">
-                                        連線時間過長，請檢查網路狀態或確認 Firebase 權限設定。
-                                    </p>
-                                )}
+                                <p className="text-sm">正在同步雲端資料庫...</p>
                             </div>
                         ) : (
                             activeTab === 'routes' ? (
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                                     {routes.length === 0 ? (
-                                        <div className="col-span-full py-20 text-center text-gray-400">
-                                            目前尚無路線資料，請點擊「新增路線」開始。
+                                        <div className="col-span-full py-20 text-center text-gray-400 bg-white rounded-xl border border-dashed">
+                                            尚未建立任何路線
                                         </div>
                                     ) : routes.map(route => (
-                                        <div key={route.id} className="bg-white rounded-xl shadow-sm border p-5 hover:shadow-md transition-shadow">
+                                        <div key={route.id} className="bg-white rounded-xl shadow-sm border p-5 hover:border-blue-300 transition-all">
                                             <div className="flex justify-between mb-2">
-                                                <span className="text-xs font-bold text-blue-600 bg-blue-50 px-2 py-1 rounded">
-                                                    {operators.find(o => o.id === route.operatorId)?.name || '未指定'}
+                                                <span className="text-[10px] font-bold text-blue-600 bg-blue-50 px-2 py-0.5 rounded">
+                                                    {operators.find(o => o.id === route.operatorId)?.name || '未指定業者'}
                                                 </span>
                                                 <span className="text-gray-400 font-mono text-xs">#{route.number}</span>
                                             </div>
                                             <h3 className="text-lg font-bold mb-3">{route.name}</h3>
-                                            <div className="text-sm text-gray-600 space-y-1">
-                                                <p>去程: {route.outbound?.length} 站 | 返程: {route.returnTrip?.length} 站</p>
-                                                <p className="text-xs text-gray-400 truncate">
-                                                    起點: {route.outbound?.[0]?.name}
-                                                </p>
+                                            <div className="text-sm text-gray-500 flex justify-between border-t pt-3">
+                                                <span>去程 {route.outbound?.length || 0} 站</span>
+                                                <span>返程 {route.returnTrip?.length || 0} 站</span>
                                             </div>
                                         </div>
                                     ))}
                                 </div>
                             ) : activeTab === 'add-route' ? (
                                 <div className="bg-white rounded-2xl p-8 max-w-2xl mx-auto border shadow-sm space-y-6">
-                                    <h2 className="text-xl font-bold">建立新路線</h2>
+                                    <h2 className="text-xl font-bold flex items-center gap-2">建立新路線</h2>
                                     <div className="grid grid-cols-2 gap-4">
-                                        <input type="text" placeholder="路線編號" className="border p-2 rounded focus:ring-2 focus:ring-blue-500 outline-none" value={newRoute.number} onChange={e => setNewRoute({...newRoute, number: e.target.value})}/>
-                                        <input type="text" placeholder="名稱 (如: 台北-桃園)" className="border p-2 rounded focus:ring-2 focus:ring-blue-500 outline-none" value={newRoute.name} onChange={e => setNewRoute({...newRoute, name: e.target.value})}/>
+                                        <div className="space-y-1">
+                                            <label className="text-xs text-gray-400">路線編號</label>
+                                            <input type="text" placeholder="例如: 706" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500 outline-none" value={newRoute.number} onChange={e => setNewRoute({...newRoute, number: e.target.value})}/>
+                                        </div>
+                                        <div className="space-y-1">
+                                            <label className="text-xs text-gray-400">路線名稱</label>
+                                            <input type="text" placeholder="例如: 三峽-西門" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500 outline-none" value={newRoute.name} onChange={e => setNewRoute({...newRoute, name: e.target.value})}/>
+                                        </div>
                                     </div>
-                                    <select className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500 outline-none" value={newRoute.operatorId} onChange={e => setNewRoute({...newRoute, operatorId: e.target.value})}>
-                                        <option value="">選擇業者...</option>
-                                        {operators.map(op => <option key={op.id} value={op.id}>{op.name}</option>)}
-                                    </select>
+                                    <div className="space-y-1">
+                                        <label className="text-xs text-gray-400">營運業者</label>
+                                        <select className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500 outline-none" value={newRoute.operatorId} onChange={e => setNewRoute({...newRoute, operatorId: e.target.value})}>
+                                            <option value="">請選擇業者...</option>
+                                            {operators.map(op => <option key={op.id} value={op.id}>{op.name}</option>)}
+                                        </select>
+                                    </div>
                                     <div className="border-2 border-dashed p-8 text-center rounded-xl bg-gray-50 hover:bg-gray-100 transition-colors">
                                         <input type="file" id="xl" className="hidden" accept=".xlsx,.xls" onChange={handleExcelUpload}/>
                                         <label htmlFor="xl" className="cursor-pointer block">
-                                            <div className="flex flex-col items-center gap-2">
-                                                <div className="text-blue-600"><i data-lucide="upload"></i></div>
-                                                <p className="font-bold text-gray-700">點擊匯入 Excel 站點資料</p>
-                                                <p className="text-xs text-gray-400">請確保工作表名稱包含「去」或「回」</p>
+                                            <div className="flex flex-col items-center gap-2 text-gray-500">
+                                                <i data-lucide="file-up"></i>
+                                                <p className="font-bold">上傳站點 Excel</p>
                                             </div>
-                                            {routeStops.outbound.length > 0 && <p className="text-green-600 text-sm mt-3 font-medium">已偵測到 {routeStops.outbound.length + routeStops.returnTrip.length} 個站點</p>}
+                                            {routeStops.outbound.length > 0 && <p className="text-green-600 text-xs mt-2">已就緒 ({routeStops.outbound.length} 站)</p>}
                                         </label>
                                     </div>
-                                    <button onClick={saveRoute} className="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold transition-colors">發布路線</button>
+                                    <button onClick={saveRoute} className="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold transition-shadow shadow-lg shadow-blue-200">發布路線到雲端</button>
                                 </div>
                             ) : (
                                 <div className="max-w-4xl mx-auto space-y-6">
                                     <div className="bg-white p-6 rounded-xl border shadow-sm">
                                         <h2 className="font-bold mb-4">註冊新業者</h2>
-                                        <div className="grid grid-cols-1 md:grid-cols-4 gap-2 items-end">
-                                            <input placeholder="業者名稱" className="border p-2 rounded" value={newOperator.name} onChange={e => setNewOperator({...newOperator, name: e.target.value})}/>
-                                            <input placeholder="聯絡人" className="border p-2 rounded" value={newOperator.contact} onChange={e => setNewOperator({...newOperator, contact: e.target.value})}/>
-                                            <input placeholder="電話" className="border p-2 rounded" value={newOperator.phone} onChange={e => setNewOperator({...newOperator, phone: e.target.value})}/>
-                                            <button onClick={saveOperator} className="bg-blue-600 hover:bg-blue-700 text-white py-2 rounded font-bold transition-colors">新增業者</button>
+                                        <div className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">
+                                            <input placeholder="業者名稱" className="border p-2 rounded text-sm" value={newOperator.name} onChange={e => setNewOperator({...newOperator, name: e.target.value})}/>
+                                            <input placeholder="聯絡人" className="border p-2 rounded text-sm" value={newOperator.contact} onChange={e => setNewOperator({...newOperator, contact: e.target.value})}/>
+                                            <input placeholder="電話" className="border p-2 rounded text-sm" value={newOperator.phone} onChange={e => setNewOperator({...newOperator, phone: e.target.value})}/>
+                                            <button onClick={saveOperator} className="bg-gray-800 hover:bg-black text-white py-2 rounded font-bold text-sm transition-colors">新增業者</button>
                                         </div>
                                     </div>
                                     <div className="bg-white rounded-xl border overflow-hidden shadow-sm">
                                         <table className="w-full text-left">
-                                            <thead className="bg-gray-50 text-xs text-gray-400 uppercase">
-                                                <tr><th className="p-4">業者名稱</th><th className="p-4">聯繫資訊</th></tr>
+                                            <thead className="bg-gray-50 text-[10px] text-gray-400 uppercase">
+                                                <tr><th className="p-4">業者</th><th className="p-4">聯繫方式</th></tr>
                                             </thead>
-                                            <tbody className="divide-y divide-gray-100">
+                                            <tbody className="divide-y divide-gray-100 text-sm">
                                                 {operators.length === 0 ? (
-                                                    <tr><td colSpan="2" className="p-10 text-center text-gray-400">尚無業者資料</td></tr>
+                                                    <tr><td colSpan="2" className="p-10 text-center text-gray-300">目前無合作業者</td></tr>
                                                 ) : operators.map(op => (
                                                     <tr key={op.id} className="hover:bg-gray-50">
-                                                        <td className="p-4 font-bold text-gray-800">{op.name}</td>
-                                                        <td className="p-4 text-sm text-gray-600">{op.contact} ({op.phone})</td>
+                                                        <td className="p-4 font-bold">{op.name}</td>
+                                                        <td className="p-4 text-gray-500">{op.contact} / {op.phone}</td>
                                                     </tr>
                                                 ))}
                                             </tbody>
@@ -290,8 +334,9 @@
                         )}
                     </main>
 
-                    <footer className="p-6 text-center text-[10px] text-gray-400 border-t bg-white">
-                        連線狀態: {loading ? '連線中' : '已連線'} | 專案 ID: {window.fb?.config?.projectId || '...'}
+                    <footer className="p-4 text-center text-[10px] text-gray-400 border-t bg-white flex justify-center gap-4">
+                        <span>連線狀態: <span className={user ? "text-green-500" : "text-orange-500"}>{user ? '已連線' : '同步中'}</span></span>
+                        <span>專案: {window.fb?.config?.projectId}</span>
                     </footer>
                 </div>
             );
@@ -300,7 +345,6 @@
         const root = ReactDOM.createRoot(document.getElementById('root'));
         root.render(<App />);
 
-        // 初始化 Lucide 圖示
         const initIcons = () => {
             if (window.lucide) {
                 lucide.createIcons();
